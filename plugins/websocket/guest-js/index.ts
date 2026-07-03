@@ -37,6 +37,11 @@ export interface ConnectionConfig {
    * Additional connect request headers.
    */
   headers?: HeadersInit
+  /**
+   * Number of incoming messages retained on the Rust side for replay via
+   * {@link WebSocket.recover}. Defaults to 256. Set to 0 to disable buffering.
+   */
+  replayBufferSize?: number
 }
 
 export interface MessageKind<T, D> {
@@ -56,13 +61,38 @@ export type Message =
   | MessageKind<'Pong', number[]>
   | MessageKind<'Close', CloseFrame | null>
 
+interface ReplayEnvelope {
+  seq: number
+  message: Message
+}
+
+interface RecoverResponse {
+  messages: ReplayEnvelope[]
+  gap: boolean
+}
+
+interface SocketState {
+  lastSeq: number
+  recovering: boolean
+  queued: ReplayEnvelope[]
+}
+
 export default class WebSocket {
   id: number
   private readonly listeners: Set<(arg: Message) => void>
+  private readonly state: SocketState
+  private readonly deliver: (envelope: ReplayEnvelope) => void
 
-  constructor(id: number, listeners: Set<(arg: Message) => void>) {
+  constructor(
+    id: number,
+    listeners: Set<(arg: Message) => void>,
+    state: SocketState,
+    deliver: (envelope: ReplayEnvelope) => void
+  ) {
     this.id = id
     this.listeners = listeners
+    this.state = state
+    this.deliver = deliver
   }
 
   static async connect(
@@ -70,12 +100,28 @@ export default class WebSocket {
     config?: ConnectionConfig
   ): Promise<WebSocket> {
     const listeners: Set<(arg: Message) => void> = new Set()
+    const state: SocketState = { lastSeq: 0, recovering: false, queued: [] }
 
-    const onMessage = new Channel<Message>()
-    onMessage.onmessage = (message: Message): void => {
+    const deliver = (envelope: ReplayEnvelope): void => {
+      if (envelope.seq > 0) {
+        // deduplicate: replay and live delivery may overlap
+        if (envelope.seq <= state.lastSeq) {
+          return
+        }
+        state.lastSeq = envelope.seq
+      }
       listeners.forEach((l) => {
-        l(message)
+        l(envelope.message)
       })
+    }
+
+    const onMessage = new Channel<ReplayEnvelope>()
+    onMessage.onmessage = (envelope: ReplayEnvelope): void => {
+      if (state.recovering) {
+        state.queued.push(envelope)
+      } else {
+        deliver(envelope)
+      }
     }
 
     if (config?.headers) {
@@ -86,7 +132,44 @@ export default class WebSocket {
       url,
       onMessage,
       config
-    }).then((id) => new WebSocket(id, listeners))
+    }).then((id) => new WebSocket(id, listeners, state, deliver))
+  }
+
+  /**
+   * Requests redelivery of messages that were received by the Rust side but
+   * may not have reached this webview, e.g. while it was suspended in the
+   * background. Recovered messages are dispatched to the registered listeners
+   * in order; messages that were already delivered are skipped.
+   *
+   * Call this when the document becomes visible again
+   * (`document.visibilitychange`).
+   *
+   * @returns `true` if messages were missed but already evicted from the
+   * replay buffer, meaning the application must resync by other means.
+   */
+  async recover(): Promise<boolean> {
+    if (this.state.recovering) {
+      return false
+    }
+    this.state.recovering = true
+    try {
+      const res = await invoke<RecoverResponse>('plugin:websocket|recover', {
+        id: this.id,
+        after: this.state.lastSeq
+      })
+      for (const envelope of res.messages) {
+        this.deliver(envelope)
+      }
+      return res.gap
+    } finally {
+      // flush messages that arrived live while we were recovering
+      const queued = this.state.queued
+      this.state.queued = []
+      this.state.recovering = false
+      for (const envelope of queued) {
+        this.deliver(envelope)
+      }
+    }
   }
 
   addListener(cb: (arg: Message) => void): () => void {

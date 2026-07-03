@@ -6,6 +6,7 @@ Allows connecting and sending data to a WebSocket server
 
 - `allow-connect`
 - `allow-send`
+- `allow-recover`
 
 ## Permission Table
 
@@ -38,6 +39,32 @@ Enables the connect command without any pre-configured scope.
 <td>
 
 Denies the connect command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`websocket:allow-recover`
+
+</td>
+<td>
+
+Enables the recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`websocket:deny-recover`
+
+</td>
+<td>
+
+Denies the recover command without any pre-configured scope.
 
 </td>
 </tr>

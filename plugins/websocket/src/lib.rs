@@ -42,7 +42,7 @@ use tokio_tungstenite::{
     },
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 
 type Id = u32;
@@ -74,6 +74,58 @@ impl Serialize for Error {
 #[derive(Default)]
 struct ConnectionManager(Mutex<HashMap<Id, WebSocketWriter>>);
 
+/// Default number of incoming messages retained per connection for replay.
+const DEFAULT_REPLAY_BUFFER_SIZE: usize = 256;
+
+/// Ring buffer of recent incoming messages so the frontend can recover
+/// messages it missed while the webview was suspended.
+struct ConnectionBuffer {
+    next_seq: u64,
+    capacity: usize,
+    buffer: VecDeque<(u64, serde_json::Value)>,
+}
+
+impl ConnectionBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            next_seq: 1,
+            capacity,
+            buffer: VecDeque::new(),
+        }
+    }
+
+    /// Assigns the next sequence number to `message`, retains it in the ring
+    /// buffer and returns the `{ seq, message }` envelope to send to JS.
+    fn push(&mut self, message: serde_json::Value) -> serde_json::Value {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        if self.capacity > 0 {
+            if self.buffer.len() == self.capacity {
+                self.buffer.pop_front();
+            }
+            self.buffer.push_back((seq, message.clone()));
+        }
+        serde_json::json!({ "seq": seq, "message": message })
+    }
+}
+
+#[derive(Default)]
+struct ReplayBuffers(Mutex<HashMap<Id, ConnectionBuffer>>);
+
+#[derive(Serialize)]
+struct ReplayedMessage {
+    seq: u64,
+    message: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct RecoverResponse {
+    messages: Vec<ReplayedMessage>,
+    /// `true` if messages newer than `after` were already evicted from the
+    /// replay buffer; the application must resync at the protocol level.
+    gap: bool,
+}
+
 #[cfg(any(
     feature = "rustls-tls",
     feature = "rustls-tls-native-roots",
@@ -99,6 +151,9 @@ pub(crate) struct ConnectionConfig {
     #[serde(default)]
     pub accept_unmasked_frames: bool,
     pub headers: Option<Vec<(String, String)>>,
+    /// Number of incoming messages retained for replay via the `recover`
+    /// command. Defaults to 256. Set to 0 to disable buffering.
+    pub replay_buffer_size: Option<usize>,
 }
 
 impl From<ConnectionConfig> for WebSocketConfig {
@@ -162,6 +217,10 @@ async fn connect<R: Runtime>(
     config: Option<ConnectionConfig>,
 ) -> Result<Id> {
     let id = rand::random();
+    let replay_capacity = config
+        .as_ref()
+        .and_then(|c| c.replay_buffer_size)
+        .unwrap_or(DEFAULT_REPLAY_BUFFER_SIZE);
     let mut request = url.as_str().into_client_request()?;
 
     if let Some(headers) = config.as_ref().and_then(|c| c.headers.as_ref()) {
@@ -205,6 +264,12 @@ async fn connect<R: Runtime>(
         let (write, read) = ws_stream.split();
         let manager = window.state::<ConnectionManager>();
         manager.0.lock().await.insert(id, write);
+        window
+            .state::<ReplayBuffers>()
+            .0
+            .lock()
+            .await
+            .insert(id, ConnectionBuffer::new(replay_capacity));
         read.for_each(move |message| {
             let window_ = window.clone();
             let on_message_ = on_message.clone();
@@ -238,13 +303,50 @@ async fn connect<R: Runtime>(
                     Err(e) => serde_json::to_value(Error::from(e)).unwrap(),
                 };
 
-                let _ = on_message_.send(response);
+                let envelope = {
+                    let buffers = window_.state::<ReplayBuffers>();
+                    let mut buffers = buffers.0.lock().await;
+                    match buffers.get_mut(&id) {
+                        Some(buffer) => buffer.push(response),
+                        None => serde_json::json!({ "seq": 0, "message": response }),
+                    }
+                };
+
+                let _ = on_message_.send(envelope);
             }
         })
         .await;
     });
 
     Ok(id)
+}
+
+/// Returns buffered incoming messages with a sequence number greater than
+/// `after`, so the frontend can catch up after the webview was suspended.
+#[tauri::command]
+async fn recover(
+    buffers: State<'_, ReplayBuffers>,
+    id: Id,
+    after: u64,
+) -> Result<RecoverResponse> {
+    let buffers = buffers.0.lock().await;
+    let buffer = buffers.get(&id).ok_or(Error::ConnectionNotFound(id))?;
+
+    let last_received = buffer.next_seq - 1;
+    let messages: Vec<ReplayedMessage> = buffer
+        .buffer
+        .iter()
+        .filter(|(seq, _)| *seq > after)
+        .map(|(seq, message)| ReplayedMessage {
+            seq: *seq,
+            message: message.clone(),
+        })
+        .collect();
+
+    let gap = last_received > after
+        && messages.first().map_or(true, |m| m.seq > after + 1);
+
+    Ok(RecoverResponse { messages, gap })
 }
 
 #[tauri::command]
@@ -313,7 +415,7 @@ where
 
     pub fn build(self) -> TauriPlugin<R> {
         PluginBuilder::new("websocket")
-            .invoke_handler(tauri::generate_handler![connect, send])
+            .invoke_handler(tauri::generate_handler![connect, send, recover])
             .setup(|app, _api| {
                 #[cfg(any(feature = "rustls-tls", feature = "rustls-tls-native-roots"))]
                 if (self.tls_connector.is_none()
@@ -325,6 +427,7 @@ where
                 }
 
                 app.manage(ConnectionManager::default());
+                app.manage(ReplayBuffers::default());
 
                 if let Some(cb) = self.merge_headers {
                     app.manage(cb);
