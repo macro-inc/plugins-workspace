@@ -13,6 +13,23 @@ document.addEventListener('DOMContentLoaded', async () => {
   await connect()
 })
 
+// Recover messages that were received by the Rust side while the webview was
+// suspended/hidden (e.g. iOS backgrounding).
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !ws) {
+    return
+  }
+  ws.recover()
+    .then((gap) => {
+      if (gap) {
+        // messages were missed but already evicted from the replay buffer;
+        // the application must resync through its own protocol
+        _updateResponse('Message gap detected, resync required')
+      }
+    })
+    .catch(_updateResponse)
+})
+
 function _updateResponse(returnValue: unknown) {
   const msg = document.createElement('p')
   msg.textContent =

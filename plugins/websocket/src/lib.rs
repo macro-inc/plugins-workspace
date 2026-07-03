@@ -109,8 +109,35 @@ impl ConnectionBuffer {
     }
 }
 
+/// Maximum number of connections to retain replay buffers for. When exceeded,
+/// the oldest buffer is dropped to free memory.
+const MAX_REPLAY_BUFFERS: usize = 5;
+
 #[derive(Default)]
-struct ReplayBuffers(Mutex<HashMap<Id, ConnectionBuffer>>);
+struct ReplayBuffersInner {
+    /// Connection ids in insertion order, oldest first.
+    order: VecDeque<Id>,
+    buffers: HashMap<Id, ConnectionBuffer>,
+}
+
+impl ReplayBuffersInner {
+    fn insert(&mut self, id: Id, buffer: ConnectionBuffer) {
+        if self.buffers.insert(id, buffer).is_none() {
+            self.order.push_back(id);
+        }
+        while self.buffers.len() > MAX_REPLAY_BUFFERS {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.buffers.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReplayBuffers(Mutex<ReplayBuffersInner>);
 
 #[derive(Serialize)]
 struct ReplayedMessage {
@@ -306,7 +333,7 @@ async fn connect<R: Runtime>(
                 let envelope = {
                     let buffers = window_.state::<ReplayBuffers>();
                     let mut buffers = buffers.0.lock().await;
-                    match buffers.get_mut(&id) {
+                    match buffers.buffers.get_mut(&id) {
                         Some(buffer) => buffer.push(response),
                         None => serde_json::json!({ "seq": 0, "message": response }),
                     }
@@ -330,7 +357,10 @@ async fn recover(
     after: u64,
 ) -> Result<RecoverResponse> {
     let buffers = buffers.0.lock().await;
-    let buffer = buffers.get(&id).ok_or(Error::ConnectionNotFound(id))?;
+    let buffer = buffers
+        .buffers
+        .get(&id)
+        .ok_or(Error::ConnectionNotFound(id))?;
 
     let last_received = buffer.next_seq - 1;
     let messages: Vec<ReplayedMessage> = buffer
