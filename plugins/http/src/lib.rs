@@ -6,8 +6,8 @@
 
 pub use reqwest;
 use tauri::{
-    Manager, Runtime,
     plugin::{Builder, TauriPlugin},
+    Manager, Runtime,
 };
 
 pub use error::{Error, Result};
@@ -32,27 +32,22 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             #[cfg(feature = "cookies")]
             let cookies_jar = {
                 use crate::reqwest_cookie_store::*;
-                use std::fs::File;
-                use std::io::BufReader;
 
-                let cache_dir = app.path().app_cache_dir()?;
-                std::fs::create_dir_all(&cache_dir)?;
+                // the app data dir survives OS storage-pressure cleanup; the
+                // cache dir (used by older versions) does not — on iOS the
+                // system deletes Library/Caches while the app isn't running,
+                // silently dropping the session
+                let data_dir = app.path().app_data_dir()?;
+                std::fs::create_dir_all(&data_dir)?;
+                let path = data_dir.join(COOKIES_FILENAME);
 
-                let path = cache_dir.join(COOKIES_FILENAME);
-                let file = File::options()
-                    .create(true)
-                    .append(true)
-                    .read(true)
-                    .open(&path)?;
+                // one-time migration of a jar persisted by an older version to
+                // the cache dir, so existing sessions survive the move
+                if let Ok(cache_dir) = app.path().app_cache_dir() {
+                    migrate_legacy_cookie_file(&cache_dir.join(COOKIES_FILENAME), &path);
+                }
 
-                let reader = BufReader::new(file);
-                CookieStoreMutex::load(path.clone(), reader).unwrap_or_else(|_e| {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!(
-                        "failed to load cookie store: {_e}, falling back to empty store"
-                    );
-                    CookieStoreMutex::new(path, Default::default())
-                })
+                CookieStoreMutex::load_or_quarantine(path)
             };
 
             let state = Http {
