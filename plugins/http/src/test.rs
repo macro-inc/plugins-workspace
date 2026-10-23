@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use super::{init_with_cookie_store_path, Http};
+use super::{init_with_cookie_store_dir, Http};
 use reqwest::{cookie::CookieStore, header::HeaderValue};
 use tauri::{
     test::{mock_builder, mock_context, noop_assets},
@@ -12,12 +12,13 @@ use tauri::{
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 #[test]
-fn configured_file_persists_cookies_across_restart() -> TestResult {
+fn configured_directory_persists_cookies_across_restart() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("support").join(".cookies");
+    let storage_dir = directory.path().join("support");
+    let path = storage_dir.join(".cookies");
     let url = "https://example.com/".parse()?;
     let app = mock_builder()
-        .plugin(init_with_cookie_store_path(&path))
+        .plugin(init_with_cookie_store_dir(&storage_dir))
         .build(mock_context(noop_assets()))?;
     {
         let http = app.state::<Http>();
@@ -31,7 +32,7 @@ fn configured_file_persists_cookies_across_restart() -> TestResult {
     drop(app);
 
     let app = mock_builder()
-        .plugin(init_with_cookie_store_path(&path))
+        .plugin(init_with_cookie_store_dir(&storage_dir))
         .build(mock_context(noop_assets()))?;
     assert_eq!(
         app.state::<Http>().cookies_jar.cookies(&url),
@@ -44,12 +45,11 @@ fn configured_file_persists_cookies_across_restart() -> TestResult {
 fn resolves_tauri_directory_variables() -> TestResult {
     let directory = tempfile::tempdir()?;
     let relative = directory.path().strip_prefix(std::env::temp_dir())?;
-    let path = std::path::PathBuf::from("$TEMP")
+    let storage_dir = std::path::PathBuf::from("$TEMP")
         .join(relative)
-        .join("nested")
-        .join(".cookies");
+        .join("nested");
     let app = mock_builder()
-        .plugin(init_with_cookie_store_path(path))
+        .plugin(init_with_cookie_store_dir(storage_dir))
         .build(mock_context(noop_assets()))?;
     let expected = directory.path().join("nested").join(".cookies");
     assert_eq!(app.state::<Http>().cookies_jar.path, expected);
@@ -63,7 +63,7 @@ fn invalid_cookie_directory_fails_setup_without_falling_back() -> TestResult {
     let parent = directory.path().join("not-a-directory");
     std::fs::write(&parent, "keep this file")?;
     let result = mock_builder()
-        .plugin(init_with_cookie_store_path(parent.join(".cookies")))
+        .plugin(init_with_cookie_store_dir(&parent))
         .build(mock_context(noop_assets()));
     assert!(result.is_err());
     assert_eq!(std::fs::read_to_string(parent)?, "keep this file");

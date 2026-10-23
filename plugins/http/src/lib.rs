@@ -29,16 +29,17 @@ pub struct Http {
 
 /// Initializes the HTTP plugin with cookies stored at `$APPCACHE/.cookies`.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
-    init_with_cookie_store_path("$APPCACHE/.cookies")
+    init_with_cookie_store_dir("$APPCACHE")
 }
 
-/// Initializes the HTTP plugin with a caller-selected cookie file.
+/// Initializes the HTTP plugin with a caller-selected cookie storage directory.
 ///
-/// Tauri base-directory variables such as `$APPLOCALDATA` are resolved during
-/// setup, and missing parent directories are created. Existing cookies are not
-/// migrated from the default location. The path is unused without `cookies`.
-pub fn init_with_cookie_store_path<R: Runtime>(path: impl Into<PathBuf>) -> TauriPlugin<R> {
-    let _cookie_store_path = path.into();
+/// The plugin stores its jar in `.cookies` inside the directory. Tauri
+/// base-directory variables such as `$APPLOCALDATA` are resolved during setup,
+/// and the directory is created if missing. Existing cookies are not migrated
+/// from the default location. The directory is unused without `cookies`.
+pub fn init_with_cookie_store_dir<R: Runtime>(directory: impl Into<PathBuf>) -> TauriPlugin<R> {
+    let _cookie_store_dir = directory.into();
     Builder::<R>::new("http")
         .setup(move |app, _| {
             #[cfg(feature = "cookies")]
@@ -47,10 +48,9 @@ pub fn init_with_cookie_store_path<R: Runtime>(path: impl Into<PathBuf>) -> Taur
                 use std::fs::File;
                 use std::io::BufReader;
 
-                let path = app.path().parse(&_cookie_store_path)?;
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
+                let directory = app.path().parse(&_cookie_store_dir)?;
+                std::fs::create_dir_all(&directory)?;
+                let path = directory.join(".cookies");
                 let file = File::options()
                     .create(true)
                     .append(true)

@@ -70,23 +70,22 @@ const response = await fetch('http://localhost:3003/users/2', {
 
 With the default `cookies` feature, `init()` persists the cookie jar at
 `$APPCACHE/.cookies`. Applications that need credentials to survive cache
-purging can select a different file:
+purging can select a different storage directory:
 
 ```rust
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_http::init_with_cookie_store_path(
-            "$APPLOCALDATA/.cookies",
-        ))
+        .plugin(tauri_plugin_http::init_with_cookie_store_dir("$APPLOCALDATA"))
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 ```
 
-The path accepts Tauri base-directory variables or an absolute file path.
-`$APPLOCALDATA` uses Application Support on iOS and macOS. Missing parent
-folders are created during setup. Changing the path does not migrate cookies;
-users must sign in again. Without the `cookies` feature, the path is unused.
+The caller passes a directory, accepting Tauri base-directory variables or an
+absolute directory path. The plugin owns the `.cookies` filename inside it.
+`$APPLOCALDATA` uses Application Support on iOS and macOS. Missing directories
+are created during setup. Changing the directory does not migrate cookies;
+users must sign in again. Without the `cookies` feature, the directory is unused.
 
 ## Contributing
 
