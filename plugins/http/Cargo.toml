@@ -41,6 +41,10 @@ cookie_store = { version = "0.22", optional = true, features = ["serde"] }
 bytes = { version = "1.9", optional = true }
 tracing = { workspace = true, optional = true }
 
+[dev-dependencies]
+tauri = { workspace = true, features = ["test"] }
+tempfile = "3"
+
 [features]
 default = [
   "rustls",

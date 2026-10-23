@@ -5,9 +5,10 @@
 //! Access the HTTP client written in Rust.
 
 pub use reqwest;
+use std::path::PathBuf;
 use tauri::{
-    Manager, Runtime,
     plugin::{Builder, TauriPlugin},
+    Manager, Runtime,
 };
 
 pub use error::{Error, Result};
@@ -18,27 +19,38 @@ mod error;
 mod reqwest_cookie_store;
 mod scope;
 
-#[cfg(feature = "cookies")]
-const COOKIES_FILENAME: &str = ".cookies";
+#[cfg(all(test, feature = "cookies"))]
+mod test;
 
 pub struct Http {
     #[cfg(feature = "cookies")]
     pub cookies_jar: std::sync::Arc<crate::reqwest_cookie_store::CookieStoreMutex>,
 }
 
+/// Initializes the HTTP plugin with cookies stored at `$APPCACHE/.cookies`.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
+    init_with_cookie_store_path("$APPCACHE/.cookies")
+}
+
+/// Initializes the HTTP plugin with a caller-selected cookie file.
+///
+/// Tauri base-directory variables such as `$APPLOCALDATA` are resolved during
+/// setup, and missing parent directories are created. Existing cookies are not
+/// migrated from the default location. The path is unused without `cookies`.
+pub fn init_with_cookie_store_path<R: Runtime>(path: impl Into<PathBuf>) -> TauriPlugin<R> {
+    let _cookie_store_path = path.into();
     Builder::<R>::new("http")
-        .setup(|app, _| {
+        .setup(move |app, _| {
             #[cfg(feature = "cookies")]
             let cookies_jar = {
                 use crate::reqwest_cookie_store::*;
                 use std::fs::File;
                 use std::io::BufReader;
 
-                let cache_dir = app.path().app_cache_dir()?;
-                std::fs::create_dir_all(&cache_dir)?;
-
-                let path = cache_dir.join(COOKIES_FILENAME);
+                let path = app.path().parse(&_cookie_store_path)?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
                 let file = File::options()
                     .create(true)
                     .append(true)
