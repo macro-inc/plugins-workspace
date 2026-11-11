@@ -228,7 +228,14 @@ pub async fn fetch<R: Runtime>(
             )
             .is_allowed(&url)
             {
-                let mut builder = reqwest::ClientBuilder::new();
+                // These settings belong to a client, not to a request, so a
+                // request that sets any of them gets a client of its own.
+                let shares_client = danger.is_none()
+                    && connect_timeout.is_none()
+                    && max_redirections.is_none()
+                    && proxy.is_none();
+
+                let mut builder = state.client_builder();
 
                 if let Some(danger_config) = danger {
                     #[cfg(not(feature = "dangerous-settings"))]
@@ -264,12 +271,13 @@ pub async fn fetch<R: Runtime>(
                     builder = attach_proxy(proxy_config, builder)?;
                 }
 
-                #[cfg(feature = "cookies")]
-                {
-                    builder = builder.cookie_provider(state.cookies_jar.clone());
-                }
+                let client = if shares_client {
+                    state.client()
+                } else {
+                    builder.build()?
+                };
 
-                let mut request = builder.build()?.request(method.clone(), url);
+                let mut request = client.request(method.clone(), url);
 
                 // POST and PUT requests should always have a 0 length content-length,
                 // if there is no body. https://fetch.spec.whatwg.org/#http-network-or-cache-fetch
@@ -317,7 +325,18 @@ pub async fn fetch<R: Runtime>(
                 #[cfg(feature = "tracing")]
                 tracing::trace!("{:?}", request);
 
-                let fut = async move { request.send().await.map_err(Into::into) };
+                let app = webview.app_handle().clone();
+                let fut = async move {
+                    let result = request.send().await;
+
+                    if shares_client {
+                        if let Err(error) = &result {
+                            app.state::<Http>().refresh_after_connect_error(error);
+                        }
+                    }
+
+                    result.map_err(Into::into)
+                };
 
                 let mut resources_table = webview.resources_table();
                 let rid = resources_table.add_request(Box::pin(fut));
