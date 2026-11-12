@@ -183,6 +183,34 @@ fn reset_connections_opens_a_new_connection() -> TestResult {
 }
 
 #[test]
+fn a_sleep_since_the_last_request_opens_a_new_connection() -> TestResult {
+    let server = Server::start()?;
+    let (app, _cookies) = app()?;
+    let http = app.state::<Http>();
+
+    get_shared(&http, &server.url)?;
+    http.backdate_last_use(Duration::from_secs(60), Duration::from_secs(60));
+    get_shared(&http, &server.url)?;
+
+    assert_eq!(server.connections(), 2);
+    Ok(())
+}
+
+#[test]
+fn an_idle_minute_without_sleep_keeps_the_connection() -> TestResult {
+    let server = Server::start()?;
+    let (app, _cookies) = app()?;
+    let http = app.state::<Http>();
+
+    get_shared(&http, &server.url)?;
+    http.backdate_last_use(Duration::from_secs(60), Duration::ZERO);
+    get_shared(&http, &server.url)?;
+
+    assert_eq!(server.connections(), 1);
+    Ok(())
+}
+
+#[test]
 fn failing_to_connect_to_a_new_origin_keeps_other_connections() -> TestResult {
     let server = Server::start()?;
     // Nothing listens on a port whose listener was dropped.
@@ -201,6 +229,8 @@ fn failing_to_connect_to_a_new_origin_keeps_other_connections() -> TestResult {
     Ok(())
 }
 
+// Only where a new client reads the system proxy settings again.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
 fn failing_to_connect_to_an_origin_reached_before_replaces_the_client() -> TestResult {
     let server = Server::start()?;
