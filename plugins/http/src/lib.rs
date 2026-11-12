@@ -6,8 +6,9 @@
 
 pub use reqwest;
 use std::{
+    collections::HashSet,
     path::PathBuf,
-    sync::{PoisonError, RwLock},
+    sync::{Mutex, PoisonError, RwLock},
 };
 use tauri::{
     plugin::{Builder, TauriPlugin},
@@ -28,12 +29,21 @@ mod test;
 /// How long a request waits without hearing from the server before the
 /// connection is probed.
 #[cfg(feature = "http2")]
-const HTTP2_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const HTTP2_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long the probe may go unanswered. A congested mobile link can take
-/// seconds to answer while it is still working, so this is generous.
+/// How long the probe may go unanswered before the connection is dropped. With
+/// the interval above, requests wait at most fifteen seconds on a connection
+/// that died without either end being told.
 #[cfg(feature = "http2")]
-const HTTP2_KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const HTTP2_KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Unread response data a connection may hold across all of its requests.
+/// Each request is already limited to 2 MB by its own window. The default
+/// connection limit of 5 MB lets three responses that are never read stop
+/// every other response on the connection, so this is far above what the
+/// requests sharing a connection can hold between them.
+#[cfg(feature = "http2")]
+const HTTP2_CONNECTION_WINDOW: u32 = 1 << 30;
 
 pub struct Http {
     #[cfg(feature = "cookies")]
@@ -41,6 +51,8 @@ pub struct Http {
     /// One client for every request, so requests to a host share its
     /// connections instead of each paying a TCP and TLS handshake.
     client: RwLock<reqwest::Client>,
+    /// Origins the current client has connected to.
+    reached: Mutex<HashSet<String>>,
 }
 
 impl Http {
@@ -58,6 +70,7 @@ impl Http {
             #[cfg(feature = "cookies")]
             cookies_jar,
             client: RwLock::new(client),
+            reached: Mutex::default(),
         })
     }
 
@@ -81,25 +94,50 @@ impl Http {
     /// opens a new one. Requests already in flight finish on theirs.
     ///
     /// Call this when connections may have died without either end being
-    /// told, such as when a mobile app returns from the background. It also
-    /// reads the system proxy settings again.
+    /// told, such as when a mobile app returns from the background or its
+    /// network changes. It also reads the system proxy settings again.
     pub fn reset_connections(&self) -> Result<()> {
         let client = self.client_builder().build()?;
         *self.client.write().unwrap_or_else(PoisonError::into_inner) = client;
+        self.reached
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         Ok(())
     }
 
-    /// Replaces the client after a request could not connect at all. The
-    /// client reads the system proxy settings when it is built, so failing
-    /// to connect can mean they have changed since.
-    pub(crate) fn refresh_after_connect_error(&self, error: &reqwest::Error) {
-        if !error.is_connect() {
-            return;
+    /// Sends a request built with the shared client.
+    ///
+    /// The client reads the system proxy settings when it is built, so when
+    /// it can no longer connect to an origin it reached before, they may have
+    /// changed: the client is replaced. Failing to connect anywhere else, such
+    /// as to a server that is not running, says nothing about the connections
+    /// to other hosts and leaves them alone.
+    pub(crate) async fn send_shared(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> reqwest::Result<reqwest::Response> {
+        let (client, request) = request.build_split();
+        let request = request?;
+        let origin = request.url().origin().ascii_serialization();
+
+        let result = client.execute(request).await;
+
+        let mut reached = self.reached.lock().unwrap_or_else(PoisonError::into_inner);
+        match &result {
+            Ok(_) => {
+                reached.insert(origin);
+            }
+            Err(error) if error.is_connect() && reached.contains(&origin) => {
+                drop(reached);
+                // A client that cannot be built leaves the current one in
+                // place; this request already reports its own failure.
+                let _ = self.reset_connections();
+            }
+            Err(_) => {}
         }
 
-        // A client that cannot be built leaves the current one in place; the
-        // request that got here already reports its own failure.
-        let _ = self.reset_connections();
+        result
     }
 }
 
@@ -118,7 +156,8 @@ fn client_builder(
     #[cfg(feature = "http2")]
     let builder = builder
         .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
-        .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT);
+        .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+        .http2_initial_connection_window_size(HTTP2_CONNECTION_WINDOW);
 
     builder
 }

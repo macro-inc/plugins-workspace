@@ -174,6 +174,75 @@ fn attach_proxy(
     Ok(builder)
 }
 
+/// Settings that reqwest fixes when a client is built.
+#[derive(Debug, Default)]
+pub(crate) struct ClientOptions {
+    pub(crate) connect_timeout: Option<u64>,
+    pub(crate) max_redirections: Option<usize>,
+    pub(crate) proxy: Option<Proxy>,
+    pub(crate) danger: Option<DangerousSettings>,
+}
+
+/// The client for a request and whether it is the shared one. A request that
+/// sets any client option gets a client of its own.
+pub(crate) fn request_client(
+    state: &Http,
+    options: ClientOptions,
+) -> crate::Result<(reqwest::Client, bool)> {
+    let ClientOptions {
+        connect_timeout,
+        max_redirections,
+        proxy,
+        danger,
+    } = options;
+
+    if connect_timeout.is_none()
+        && max_redirections.is_none()
+        && proxy.is_none()
+        && danger.is_none()
+    {
+        return Ok((state.client(), true));
+    }
+
+    let mut builder = state.client_builder();
+
+    if let Some(danger_config) = danger {
+        #[cfg(not(feature = "dangerous-settings"))]
+        {
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("[\x1b[33mWARNING\x1b[0m] using dangerous settings requires `dangerous-settings` feature flag in your Cargo.toml");
+            }
+            let _ = danger_config;
+            return Err(Error::DangerousSettings);
+        }
+        #[cfg(feature = "dangerous-settings")]
+        {
+            builder = builder
+                .danger_accept_invalid_certs(danger_config.accept_invalid_certs)
+                .danger_accept_invalid_hostnames(danger_config.accept_invalid_hostnames)
+        }
+    }
+
+    if let Some(timeout) = connect_timeout {
+        builder = builder.connect_timeout(Duration::from_millis(timeout));
+    }
+
+    if let Some(max_redirections) = max_redirections {
+        builder = builder.redirect(if max_redirections == 0 {
+            Policy::none()
+        } else {
+            Policy::limited(max_redirections)
+        });
+    }
+
+    if let Some(proxy_config) = proxy {
+        builder = attach_proxy(proxy_config, builder)?;
+    }
+
+    Ok((builder.build()?, false))
+}
+
 #[command]
 pub async fn fetch<R: Runtime>(
     webview: Webview<R>,
@@ -228,54 +297,15 @@ pub async fn fetch<R: Runtime>(
             )
             .is_allowed(&url)
             {
-                // These settings belong to a client, not to a request, so a
-                // request that sets any of them gets a client of its own.
-                let shares_client = danger.is_none()
-                    && connect_timeout.is_none()
-                    && max_redirections.is_none()
-                    && proxy.is_none();
-
-                let mut builder = state.client_builder();
-
-                if let Some(danger_config) = danger {
-                    #[cfg(not(feature = "dangerous-settings"))]
-                    {
-                        #[cfg(debug_assertions)]
-                        {
-                            eprintln!("[\x1b[33mWARNING\x1b[0m] using dangerous settings requires `dangerous-settings` feature flag in your Cargo.toml");
-                        }
-                        let _ = danger_config;
-                        return Err(Error::DangerousSettings);
-                    }
-                    #[cfg(feature = "dangerous-settings")]
-                    {
-                        builder = builder
-                            .danger_accept_invalid_certs(danger_config.accept_invalid_certs)
-                            .danger_accept_invalid_hostnames(danger_config.accept_invalid_hostnames)
-                    }
-                }
-
-                if let Some(timeout) = connect_timeout {
-                    builder = builder.connect_timeout(Duration::from_millis(timeout));
-                }
-
-                if let Some(max_redirections) = max_redirections {
-                    builder = builder.redirect(if max_redirections == 0 {
-                        Policy::none()
-                    } else {
-                        Policy::limited(max_redirections)
-                    });
-                }
-
-                if let Some(proxy_config) = proxy {
-                    builder = attach_proxy(proxy_config, builder)?;
-                }
-
-                let client = if shares_client {
-                    state.client()
-                } else {
-                    builder.build()?
-                };
+                let (client, shares_client) = request_client(
+                    &state,
+                    ClientOptions {
+                        connect_timeout,
+                        max_redirections,
+                        proxy,
+                        danger,
+                    },
+                )?;
 
                 let mut request = client.request(method.clone(), url);
 
@@ -327,13 +357,11 @@ pub async fn fetch<R: Runtime>(
 
                 let app = webview.app_handle().clone();
                 let fut = async move {
-                    let result = request.send().await;
-
-                    if shares_client {
-                        if let Err(error) = &result {
-                            app.state::<Http>().refresh_after_connect_error(error);
-                        }
-                    }
+                    let result = if shares_client {
+                        app.state::<Http>().send_shared(request).await
+                    } else {
+                        request.send().await
+                    };
 
                     result.map_err(Into::into)
                 };
