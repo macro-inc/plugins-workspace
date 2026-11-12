@@ -9,6 +9,7 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     sync::{Mutex, PoisonError, RwLock},
+    time::{Duration, Instant, SystemTime},
 };
 use tauri::{
     plugin::{Builder, TauriPlugin},
@@ -29,13 +30,16 @@ mod test;
 /// How long a request waits without hearing from the server before the
 /// connection is probed.
 #[cfg(feature = "http2")]
-const HTTP2_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How long the probe may go unanswered before the connection is dropped. With
-/// the interval above, requests wait at most fifteen seconds on a connection
-/// that died without either end being told.
+/// How long the probe may go unanswered before the connection is dropped. The
+/// answer queues behind data already in flight, so on a slow link a large
+/// upload or a burst of responses can delay it by many seconds; a shorter
+/// wait drops connections that are slow, not dead, and fails every request on
+/// them. With the interval above, requests wait at most twenty-five seconds
+/// on a connection that died without either end being told.
 #[cfg(feature = "http2")]
-const HTTP2_KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Unread response data a connection may hold across all of its requests.
 /// Each request is already limited to 2 MB by its own window. The default
@@ -45,6 +49,44 @@ const HTTP2_KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 #[cfg(feature = "http2")]
 const HTTP2_CONNECTION_WINDOW: u32 = 1 << 30;
 
+/// A sleep at least this long drops the pooled connections.
+const SLEEP_RESET: Duration = Duration::from_secs(10);
+
+/// Whether building a client can read the system proxy settings again.
+/// `reqwest` does so on these platforms when its `system-proxy` feature is on,
+/// which this crate leaves to the app. Elsewhere the proxy comes from the
+/// environment, which does not change while the app runs, so a new client
+/// would differ from the old one only in having lost its connections.
+const REREADS_SYSTEM_PROXY: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
+/// When the shared client was last asked for.
+#[derive(Clone, Copy)]
+struct LastUse {
+    /// By the wall clock, which keeps running while the machine sleeps.
+    wall: SystemTime,
+    /// By the clock the connection pool uses. On Apple platforms, Linux and
+    /// Android it stops while the machine sleeps.
+    awake: Instant,
+}
+
+impl LastUse {
+    fn now() -> Self {
+        Self {
+            wall: SystemTime::now(),
+            awake: Instant::now(),
+        }
+    }
+
+    /// How long the machine slept between `self` and `later`: how far the
+    /// wall clock ran ahead of the other. A wall clock set backwards counts
+    /// as no sleep.
+    fn slept_until(&self, later: &Self) -> Duration {
+        let wall = later.wall.duration_since(self.wall).unwrap_or_default();
+        let awake = later.awake.duration_since(self.awake);
+        wall.saturating_sub(awake)
+    }
+}
+
 pub struct Http {
     #[cfg(feature = "cookies")]
     pub cookies_jar: std::sync::Arc<crate::reqwest_cookie_store::CookieStoreMutex>,
@@ -53,6 +95,7 @@ pub struct Http {
     client: RwLock<reqwest::Client>,
     /// Origins the current client has connected to.
     reached: Mutex<HashSet<String>>,
+    last_use: Mutex<LastUse>,
 }
 
 impl Http {
@@ -71,6 +114,7 @@ impl Http {
             cookies_jar,
             client: RwLock::new(client),
             reached: Mutex::default(),
+            last_use: Mutex::new(LastUse::now()),
         })
     }
 
@@ -83,11 +127,42 @@ impl Http {
     }
 
     /// The client whose connections requests share.
+    ///
+    /// The pool expires idle connections by a clock that stops while the
+    /// machine sleeps, so after a sleep it would reuse connections the server
+    /// and the network gave up on long before. If the machine slept at least
+    /// ten seconds since the client was last asked for, the connections are
+    /// dropped first. Where that clock runs through sleep, the pool's own
+    /// idle limit covers it.
     pub(crate) fn client(&self) -> reqwest::Client {
+        {
+            // Held until the client is replaced: requests that wake together
+            // wait here for the new client instead of taking the old one.
+            let mut last_use = self.last_use.lock().unwrap_or_else(PoisonError::into_inner);
+            let now = LastUse::now();
+            // A client that cannot be built leaves the current one in place,
+            // and the sleep on record for the next request to try again.
+            if last_use.slept_until(&now) < SLEEP_RESET || self.reset_connections().is_ok() {
+                *last_use = now;
+            }
+        }
+
         self.client
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Moves the last use back as if the machine had been idle for `idle`,
+    /// of which it slept for `asleep`.
+    #[cfg(test)]
+    pub(crate) fn backdate_last_use(&self, idle: Duration, asleep: Duration) {
+        let mut last_use = self.last_use.lock().unwrap_or_else(PoisonError::into_inner);
+        last_use.wall -= idle;
+        // Some platforms cannot name an instant before the machine started.
+        if let Some(earlier) = last_use.awake.checked_sub(idle.saturating_sub(asleep)) {
+            last_use.awake = earlier;
+        }
     }
 
     /// Stops reusing the open connections, so the next request to each host
@@ -95,7 +170,8 @@ impl Http {
     ///
     /// Call this when connections may have died without either end being
     /// told, such as when a mobile app returns from the background or its
-    /// network changes. It also reads the system proxy settings again.
+    /// network changes. Where `reqwest` reads the system proxy settings, it
+    /// reads them again.
     pub fn reset_connections(&self) -> Result<()> {
         let client = self.client_builder().build()?;
         *self.client.write().unwrap_or_else(PoisonError::into_inner) = client;
@@ -108,15 +184,20 @@ impl Http {
 
     /// Sends a request built with the shared client.
     ///
-    /// The client reads the system proxy settings when it is built, so when
-    /// it can no longer connect to an origin it reached before, they may have
-    /// changed: the client is replaced. Failing to connect anywhere else, such
-    /// as to a server that is not running, says nothing about the connections
-    /// to other hosts and leaves them alone.
+    /// Where the client reads the system proxy settings when it is built,
+    /// they may have changed when it can no longer connect to an origin it
+    /// reached before: the client is replaced. Failing to connect anywhere
+    /// else, such as to a server that is not running, says nothing about the
+    /// connections to other hosts and leaves them alone. So does any failure
+    /// on a platform where a new client would read nothing new.
     pub(crate) async fn send_shared(
         &self,
         request: reqwest::RequestBuilder,
     ) -> reqwest::Result<reqwest::Response> {
+        if !REREADS_SYSTEM_PROXY {
+            return request.send().await;
+        }
+
         let (client, request) = request.build_split();
         let request = request?;
         let origin = request.url().origin().ascii_serialization();
