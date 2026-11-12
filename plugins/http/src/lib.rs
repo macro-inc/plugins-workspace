@@ -52,10 +52,11 @@ const HTTP2_CONNECTION_WINDOW: u32 = 1 << 30;
 /// A sleep at least this long drops the pooled connections.
 const SLEEP_RESET: Duration = Duration::from_secs(10);
 
-/// Whether building a client reads the system proxy settings again. Elsewhere
-/// the proxy comes from the environment, which does not change while the app
-/// runs, so a new client would differ from the old one only in having lost
-/// its connections.
+/// Whether building a client can read the system proxy settings again.
+/// `reqwest` does so on these platforms when its `system-proxy` feature is on,
+/// which this crate leaves to the app. Elsewhere the proxy comes from the
+/// environment, which does not change while the app runs, so a new client
+/// would differ from the old one only in having lost its connections.
 const REREADS_SYSTEM_PROXY: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
 /// When the shared client was last asked for.
@@ -63,7 +64,8 @@ const REREADS_SYSTEM_PROXY: bool = cfg!(any(target_os = "macos", target_os = "wi
 struct LastUse {
     /// By the wall clock, which keeps running while the machine sleeps.
     wall: SystemTime,
-    /// By the clock the connection pool uses, which stops during sleep.
+    /// By the clock the connection pool uses. On Apple platforms, Linux and
+    /// Android it stops while the machine sleeps.
     awake: Instant,
 }
 
@@ -128,18 +130,21 @@ impl Http {
     ///
     /// The pool expires idle connections by a clock that stops while the
     /// machine sleeps, so after a sleep it would reuse connections the server
-    /// and the network gave up on long before. If the machine slept since the
-    /// client was last asked for, the connections are dropped first. Where
-    /// that clock runs through sleep, the pool's own idle limit covers it.
+    /// and the network gave up on long before. If the machine slept at least
+    /// ten seconds since the client was last asked for, the connections are
+    /// dropped first. Where that clock runs through sleep, the pool's own
+    /// idle limit covers it.
     pub(crate) fn client(&self) -> reqwest::Client {
-        let now = LastUse::now();
-        let previous = std::mem::replace(
-            &mut *self.last_use.lock().unwrap_or_else(PoisonError::into_inner),
-            now,
-        );
-        if previous.slept_until(&now) >= SLEEP_RESET {
-            // A client that cannot be built leaves the current one in place.
-            let _ = self.reset_connections();
+        {
+            // Held until the client is replaced: requests that wake together
+            // wait here for the new client instead of taking the old one.
+            let mut last_use = self.last_use.lock().unwrap_or_else(PoisonError::into_inner);
+            let now = LastUse::now();
+            // A client that cannot be built leaves the current one in place,
+            // and the sleep on record for the next request to try again.
+            if last_use.slept_until(&now) < SLEEP_RESET || self.reset_connections().is_ok() {
+                *last_use = now;
+            }
         }
 
         self.client
@@ -154,7 +159,10 @@ impl Http {
     pub(crate) fn backdate_last_use(&self, idle: Duration, asleep: Duration) {
         let mut last_use = self.last_use.lock().unwrap_or_else(PoisonError::into_inner);
         last_use.wall -= idle;
-        last_use.awake -= idle - asleep;
+        // Some platforms cannot name an instant before the machine started.
+        if let Some(earlier) = last_use.awake.checked_sub(idle.saturating_sub(asleep)) {
+            last_use.awake = earlier;
+        }
     }
 
     /// Stops reusing the open connections, so the next request to each host
@@ -162,8 +170,8 @@ impl Http {
     ///
     /// Call this when connections may have died without either end being
     /// told, such as when a mobile app returns from the background or its
-    /// network changes. On macOS and Windows it also reads the system proxy
-    /// settings again.
+    /// network changes. Where `reqwest` reads the system proxy settings, it
+    /// reads them again.
     pub fn reset_connections(&self) -> Result<()> {
         let client = self.client_builder().build()?;
         *self.client.write().unwrap_or_else(PoisonError::into_inner) = client;

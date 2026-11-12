@@ -4,7 +4,7 @@
 
 use super::{
     commands::{request_client, ClientOptions},
-    init_with_cookie_store_dir, Http,
+    init_with_cookie_store_dir, Http, REREADS_SYSTEM_PROXY,
 };
 use reqwest::{cookie::CookieStore, header::HeaderValue};
 use std::{
@@ -25,11 +25,13 @@ use tauri::{
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = std::result::Result<(), TestError>;
 
-/// An HTTP/1.1 server that counts the connections it accepts.
+/// An HTTP/1.1 server that counts the connections it accepts and the
+/// requests its first connection serves.
 struct Server {
     url: String,
     address: SocketAddr,
     connections: Arc<AtomicUsize>,
+    first_connection_requests: Arc<AtomicUsize>,
     stopping: Arc<AtomicBool>,
     accepting: Option<JoinHandle<()>>,
 }
@@ -49,8 +51,10 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let connections = Arc::new(AtomicUsize::new(0));
+        let first_connection_requests = Arc::new(AtomicUsize::new(0));
         let stopping = Arc::new(AtomicBool::new(false));
         let accepted = connections.clone();
+        let on_first = first_connection_requests.clone();
         let stop = stopping.clone();
 
         let accepting = std::thread::spawn(move || {
@@ -63,7 +67,8 @@ impl Server {
                 let Ok(requests) = stream.try_clone() else {
                     return;
                 };
-                accepted.fetch_add(1, Ordering::SeqCst);
+                let first = accepted.fetch_add(1, Ordering::SeqCst) == 0;
+                let on_first = on_first.clone();
 
                 // Answer every request on the connection until either end closes it.
                 std::thread::spawn(move || {
@@ -71,6 +76,9 @@ impl Server {
                     while let Some(Ok(line)) = lines.next() {
                         if !line.is_empty() {
                             continue;
+                        }
+                        if first {
+                            on_first.fetch_add(1, Ordering::SeqCst);
                         }
                         let connection = if keep_alive { "keep-alive" } else { "close" };
                         let response = format!(
@@ -89,6 +97,7 @@ impl Server {
             url: format!("http://{address}/"),
             address,
             connections,
+            first_connection_requests,
             stopping,
             accepting: Some(accepting),
         })
@@ -96,6 +105,10 @@ impl Server {
 
     fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    fn first_connection_requests(&self) -> usize {
+        self.first_connection_requests.load(Ordering::SeqCst)
     }
 
     /// Stops listening. Returns once the port refuses connections.
@@ -191,8 +204,40 @@ fn a_sleep_since_the_last_request_opens_a_new_connection() -> TestResult {
     get_shared(&http, &server.url)?;
     http.backdate_last_use(Duration::from_secs(60), Duration::from_secs(60));
     get_shared(&http, &server.url)?;
-
     assert_eq!(server.connections(), 2);
+
+    // The sleep is behind it: the next request reuses the new connection.
+    get_shared(&http, &server.url)?;
+    assert_eq!(server.connections(), 2);
+    Ok(())
+}
+
+#[test]
+fn requests_that_wake_together_all_leave_the_old_connection() -> TestResult {
+    const ROUNDS: usize = 20;
+    const REQUESTS: usize = 8;
+
+    for _ in 0..ROUNDS {
+        let server = Server::start()?;
+        let (app, _cookies) = app()?;
+        let http = app.state::<Http>();
+
+        get_shared(&http, &server.url)?;
+        http.backdate_last_use(Duration::from_secs(60), Duration::from_secs(60));
+
+        let together = std::sync::Barrier::new(REQUESTS);
+        std::thread::scope(|scope| {
+            for _ in 0..REQUESTS {
+                scope.spawn(|| {
+                    together.wait();
+                    get_shared(&http, &server.url).expect("request after the sleep");
+                });
+            }
+        });
+
+        // Only the request before the sleep used the connection from before it.
+        assert_eq!(server.first_connection_requests(), 1);
+    }
     Ok(())
 }
 
@@ -229,10 +274,9 @@ fn failing_to_connect_to_a_new_origin_keeps_other_connections() -> TestResult {
     Ok(())
 }
 
-// Only where a new client reads the system proxy settings again.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-fn failing_to_connect_to_an_origin_reached_before_replaces_the_client() -> TestResult {
+fn failing_to_connect_to_an_origin_reached_before_replaces_the_client_where_it_can_differ(
+) -> TestResult {
     let server = Server::start()?;
     let mut stopped = Server::start_closing_connections()?;
     let (app, _cookies) = app()?;
@@ -244,12 +288,14 @@ fn failing_to_connect_to_an_origin_reached_before_replaces_the_client() -> TestR
     assert!(get_shared(&http, &stopped.url).is_err());
     get_shared(&http, &server.url)?;
 
-    assert_eq!(server.connections(), 2);
+    // A new client only where it can read different proxy settings.
+    let connections = if REREADS_SYSTEM_PROXY { 2 } else { 1 };
+    assert_eq!(server.connections(), connections);
 
     // The replacement has not reached that origin, so failing again changes nothing.
     assert!(get_shared(&http, &stopped.url).is_err());
     get_shared(&http, &server.url)?;
-    assert_eq!(server.connections(), 2);
+    assert_eq!(server.connections(), connections);
     Ok(())
 }
 
