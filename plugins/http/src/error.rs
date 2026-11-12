@@ -50,7 +50,27 @@ impl Serialize for Error {
     where
         S: Serializer,
     {
-        serializer.serialize_str(self.to_string().as_ref())
+        serializer.serialize_str(&self.message_with_causes())
+    }
+}
+
+impl Error {
+    /// The message followed by each underlying cause. reqwest's own message
+    /// only says that sending failed; the DNS, connect or TLS reason that
+    /// tells a caller why is in its sources, e.g. `error sending request for
+    /// url (…): client error (Connect): invalid peer certificate: UnknownIssuer`.
+    pub(crate) fn message_with_causes(&self) -> String {
+        let mut message = self.to_string();
+        let mut source = std::error::Error::source(self);
+        while let Some(cause) = source {
+            let text = cause.to_string();
+            if !message.contains(&text) {
+                message.push_str(": ");
+                message.push_str(&text);
+            }
+            source = cause.source();
+        }
+        message
     }
 }
 

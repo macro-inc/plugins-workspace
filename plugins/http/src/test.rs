@@ -418,3 +418,23 @@ fn invalid_cookie_directory_fails_setup_without_falling_back() -> TestResult {
     assert_eq!(std::fs::read_to_string(parent)?, "keep this file");
     Ok(())
 }
+
+#[test]
+fn a_request_that_cannot_connect_reports_why() -> TestResult {
+    // A port nothing listens on: binding then dropping the listener frees it.
+    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let (app, _cookies) = app()?;
+    let http = app.state::<Http>();
+    let (client, _) = request_client(&http, ClientOptions::default())?;
+    let url = format!("http://127.0.0.1:{port}/");
+
+    let error = match tauri::async_runtime::block_on(client.get(&url).send()) {
+        Ok(_) => return Err("a closed port answered".into()),
+        Err(error) => crate::Error::from(error),
+    };
+    let message = error.message_with_causes();
+
+    assert!(message.starts_with(&error.to_string()));
+    assert!(message.len() > error.to_string().len(), "{message}");
+    Ok(())
+}
