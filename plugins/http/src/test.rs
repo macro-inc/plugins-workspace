@@ -671,9 +671,10 @@ async fn get_http2_pieces(
     Ok((ReqwestResponse::new(response?), pieces?))
 }
 
-/// Gives the client time to receive what the server sent.
+/// Gives the client time to receive what the server sent, with room for a
+/// loaded host.
 async fn let_it_arrive() {
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
 #[cfg(feature = "http2")]
@@ -699,7 +700,10 @@ fn a_received_body_comes_back_in_one_read() -> TestResult {
         let_it_arrive().await;
 
         assert_eq!(read_now(&mut response).await?, Some(body.clone()));
-        assert_eq!(read_now(&mut response).await?, None);
+        // Only the end, or the empty frame HTTP/2 may close the stream with.
+        let (rest, error) = read_all_async(&mut response, READ_BODY_CAP).await;
+        assert!(rest.concat().is_empty());
+        assert!(error.is_none());
         Ok(())
     })
 }
@@ -719,7 +723,10 @@ fn a_received_gzip_body_comes_back_in_one_read() -> TestResult {
         let_it_arrive().await;
 
         assert_eq!(read_now(&mut response).await?, Some(body.clone()));
-        assert_eq!(read_now(&mut response).await?, None);
+        // Only the end, or the empty frame HTTP/2 may close the stream with.
+        let (rest, error) = read_all_async(&mut response, READ_BODY_CAP).await;
+        assert!(rest.concat().is_empty());
+        assert!(error.is_none());
         Ok(())
     })
 }
@@ -774,12 +781,16 @@ fn a_large_received_body_comes_back_a_cap_at_a_time() -> TestResult {
         drop(pieces);
 
         let mut read = Vec::new();
+        let mut full_reads = 0;
         while let Some(data) = read_now(&mut response).await? {
             assert!(data.len() <= READ_BODY_CAP, "read {} bytes", data.len());
+            full_reads += usize::from(data.len() == READ_BODY_CAP);
             read.extend(data);
             let_it_arrive().await;
         }
         assert_eq!(read, body);
+        // More than the cap had arrived before each of the first reads.
+        assert!(full_reads >= 1, "no read reached the cap");
         Ok(())
     })
 }

@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use reqwest::{redirect::Policy, NoProxy};
 use serde::{Deserialize, Serialize};
@@ -36,7 +37,7 @@ pub(crate) struct ReqwestResponse {
     res: reqwest::Response,
     /// What a read took from the body but did not return: data past the cap,
     /// the end of the body, or a body error. The next read returns it first.
-    held: Option<std::result::Result<Option<Vec<u8>>, reqwest::Error>>,
+    held: Option<std::result::Result<Option<Bytes>, reqwest::Error>>,
 }
 impl tauri::Resource for ReqwestResponse {}
 
@@ -52,16 +53,24 @@ impl ReqwestResponse {
     pub(crate) async fn read(&mut self, cap: usize) -> Result<Option<Vec<u8>>> {
         let first = match self.held.take() {
             Some(held) => held?,
-            None => self.res.chunk().await?.map(|chunk| chunk.to_vec()),
+            None => self.res.chunk().await?,
         };
-        let Some(mut data) = first else {
+        let Some(mut first) = first else {
             return Ok(None);
         };
+        // A chunk larger than the cap (a `data:` URL is one chunk) is returned
+        // a cap at a time; the loop below then has no room left to run.
+        if first.len() > cap {
+            self.held = Some(Ok(Some(first.split_off(cap))));
+        }
+        let mut data = first.to_vec();
 
         while data.len() < cap {
             // Poll once: a chunk that is not ready yet ends this read. The
             // future keeps no state of its own, so dropping it while pending
-            // leaves the body where it was.
+            // leaves the body where it was. That poll also starts reqwest's
+            // read timeout until the next read; the plugin sets none, and one
+            // set later would have to allow for the time between reads.
             let mut chunk = pin!(self.res.chunk());
             let polled = std::future::poll_fn(|cx| Poll::Ready(chunk.as_mut().poll(cx)));
             let Poll::Ready(next) = polled.await else {
@@ -74,14 +83,10 @@ impl ReqwestResponse {
                 // A chunk past the cap, the end, or an error: the next read
                 // returns it, after this one returns the data it already has.
                 next => {
-                    self.held = Some(next.map(|chunk| chunk.map(|chunk| chunk.to_vec())));
+                    self.held = Some(next);
                     break;
                 }
             }
-        }
-        // Only a first chunk can pass the cap.
-        if data.len() > cap {
-            self.held = Some(Ok(Some(data.split_off(cap))));
         }
         Ok(Some(data))
     }
