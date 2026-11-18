@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::{
-    commands::{request_client, ClientOptions},
+    commands::{request_client, ClientOptions, ReqwestResponse, READ_BODY_CAP},
     init_with_cookie_store_dir, Http, REREADS_SYSTEM_PROXY,
 };
 use reqwest::{cookie::CookieStore, header::HeaderValue};
@@ -416,5 +416,411 @@ fn invalid_cookie_directory_fails_setup_without_falling_back() -> TestResult {
         .build(mock_context(noop_assets()));
     assert!(result.is_err());
     assert_eq!(std::fs::read_to_string(parent)?, "keep this file");
+    Ok(())
+}
+
+/// One step of a [`ScriptedBody`].
+enum Step {
+    Data(Vec<u8>),
+    /// Not ready on this poll; ready again right after.
+    Pending,
+    Trailers,
+    Error,
+}
+
+/// A response body that answers each poll with its next step, then ends.
+struct ScriptedBody {
+    steps: std::collections::VecDeque<Step>,
+    ended: bool,
+}
+
+impl hyper::body::Body for ScriptedBody {
+    type Data = hyper::body::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+    {
+        use hyper::body::Frame;
+        use std::task::Poll;
+
+        assert!(!self.ended, "the body was polled after its end");
+        match self.steps.pop_front() {
+            Some(Step::Data(data)) => Poll::Ready(Some(Ok(Frame::data(data.into())))),
+            Some(Step::Pending) => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Some(Step::Trailers) => Poll::Ready(Some(Ok(Frame::trailers(http::HeaderMap::new())))),
+            Some(Step::Error) => Poll::Ready(Some(Err(std::io::Error::other("connection reset")))),
+            None => {
+                self.ended = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+fn scripted(steps: Vec<Step>) -> ReqwestResponse {
+    let body = ScriptedBody {
+        steps: steps.into(),
+        ended: false,
+    };
+    ReqwestResponse::new(http::Response::new(reqwest::Body::wrap(body)).into())
+}
+
+/// Every read until the end of the body or an error, as the page makes them.
+async fn read_all_async(
+    response: &mut ReqwestResponse,
+    cap: usize,
+) -> (Vec<Vec<u8>>, Option<crate::Error>) {
+    let mut reads = Vec::new();
+    loop {
+        match response.read(cap).await {
+            Ok(Some(data)) => reads.push(data),
+            Ok(None) => return (reads, None),
+            Err(error) => return (reads, Some(error)),
+        }
+    }
+}
+
+fn read_all(response: &mut ReqwestResponse, cap: usize) -> (Vec<Vec<u8>>, Option<crate::Error>) {
+    tauri::async_runtime::block_on(read_all_async(response, cap))
+}
+
+fn bytes(text: &str) -> Step {
+    Step::Data(text.as_bytes().to_vec())
+}
+
+#[test]
+fn a_read_takes_every_chunk_that_is_ready_and_waits_for_none() {
+    let mut response = scripted(vec![
+        bytes("a"),
+        bytes("b"),
+        Step::Trailers,
+        bytes("c"),
+        Step::Pending,
+        bytes("d"),
+        Step::Pending,
+        Step::Pending,
+        bytes("e"),
+    ]);
+
+    let (reads, error) = read_all(&mut response, READ_BODY_CAP);
+
+    assert_eq!(reads, [b"abc".to_vec(), b"d".to_vec(), b"e".to_vec()]);
+    assert!(error.is_none());
+}
+
+#[test]
+fn a_read_stays_within_the_cap() {
+    let mut response = scripted(vec![
+        bytes("12345"),
+        bytes("1234"),
+        bytes("123"),
+        bytes("1"),
+    ]);
+    let (reads, _) = read_all(&mut response, 10);
+    assert_eq!(reads, [b"123451234".to_vec(), b"1231".to_vec()]);
+
+    // A first chunk larger than the cap is split.
+    let mut response = scripted(vec![bytes("1234567890123456789012345"), bytes("1")]);
+    let (reads, _) = read_all(&mut response, 10);
+    assert_eq!(
+        reads,
+        [
+            b"1234567890".to_vec(),
+            b"1234567890".to_vec(),
+            b"123451".to_vec()
+        ]
+    );
+}
+
+#[test]
+fn an_error_after_data_ends_the_next_read() {
+    let mut response = scripted(vec![bytes("a"), bytes("b"), Step::Error, bytes("never")]);
+
+    let (reads, error) = read_all(&mut response, READ_BODY_CAP);
+
+    assert_eq!(reads, [b"ab".to_vec()]);
+    assert!(matches!(error, Some(crate::Error::Network(_))));
+}
+
+#[test]
+fn an_error_before_any_data_ends_the_first_read() {
+    let mut response = scripted(vec![Step::Pending, Step::Error]);
+    let (reads, error) = read_all(&mut response, READ_BODY_CAP);
+    assert!(reads.is_empty());
+    assert!(error.is_some());
+}
+
+#[test]
+fn the_end_found_by_a_read_is_reported_by_the_next_without_polling_again() {
+    // `ScriptedBody` panics if polled after its end.
+    let mut response = scripted(vec![bytes("a"), bytes("b")]);
+    let (reads, error) = read_all(&mut response, READ_BODY_CAP);
+    assert_eq!(reads, [b"ab".to_vec()]);
+    assert!(error.is_none());
+
+    let mut response = scripted(vec![]);
+    let (reads, error) = read_all(&mut response, READ_BODY_CAP);
+    assert!(reads.is_empty());
+    assert!(error.is_none());
+}
+
+/// `len` bytes that are not all the same, so misordered data shows.
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// `data` as gzip with stored (uncompressed) deflate blocks.
+#[cfg(feature = "gzip")]
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+    let mut blocks = data.chunks(0xffff).peekable();
+    while let Some(block) = blocks.next() {
+        out.push(u8::from(blocks.peek().is_none()));
+        let len = block.len() as u16;
+        out.extend(len.to_le_bytes());
+        out.extend((!len).to_le_bytes());
+        out.extend(block);
+    }
+    out.extend((!crc).to_le_bytes());
+    out.extend((data.len() as u32).to_le_bytes());
+    out
+}
+
+/// A body the test sends piece by piece.
+struct ChannelBody(tokio::sync::mpsc::UnboundedReceiver<hyper::body::Bytes>);
+
+impl hyper::body::Body for ChannelBody {
+    type Data = hyper::body::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+    {
+        self.0
+            .poll_recv(cx)
+            .map(|piece| piece.map(|piece| Ok(hyper::body::Frame::data(piece))))
+    }
+}
+
+type Pieces = tokio::sync::mpsc::UnboundedSender<hyper::body::Bytes>;
+
+/// An HTTP/2 server that answers one request with `headers` and a body the
+/// test sends through the returned sender.
+#[cfg(feature = "http2")]
+async fn serve_http2_pieces(
+    headers: &'static [(&'static str, &'static str)],
+) -> std::io::Result<(SocketAddr, tokio::sync::oneshot::Receiver<Pieces>)> {
+    use hyper::{service::service_fn, Request, Response};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (on_request, requested) = tokio::sync::oneshot::channel();
+    tauri::async_runtime::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let on_request = std::sync::Mutex::new(Some(on_request));
+        let service = service_fn(move |_: Request<hyper::body::Incoming>| {
+            let (pieces, body) = tokio::sync::mpsc::unbounded_channel();
+            if let Some(on_request) = on_request.lock().unwrap().take() {
+                let _ = on_request.send(pieces);
+            }
+            let mut response = Response::new(ChannelBody(body));
+            for (name, value) in headers {
+                response
+                    .headers_mut()
+                    .insert(*name, HeaderValue::from_static(value));
+            }
+            async move { Ok::<_, hyper::Error>(response) }
+        });
+        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    });
+    Ok((address, requested))
+}
+
+/// Sends a GET with the shared client's settings over HTTP/2 without TLS to
+/// a server answering with `headers`. Returns the response, once its headers
+/// arrived, and the sender of its body.
+#[cfg(feature = "http2")]
+async fn get_http2_pieces(
+    http: &Http,
+    headers: &'static [(&'static str, &'static str)],
+) -> std::result::Result<(ReqwestResponse, Pieces), TestError> {
+    let (address, requested) = serve_http2_pieces(headers).await?;
+    let client = http.client_builder().http2_prior_knowledge().build()?;
+    let (response, pieces) =
+        tokio::join!(client.get(format!("http://{address}/")).send(), requested);
+    Ok((ReqwestResponse::new(response?), pieces?))
+}
+
+/// Gives the client time to receive what the server sent, with room for a
+/// loaded host.
+async fn let_it_arrive() {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+
+#[cfg(feature = "http2")]
+async fn read_now(
+    response: &mut ReqwestResponse,
+) -> std::result::Result<Option<Vec<u8>>, TestError> {
+    Ok(tokio::time::timeout(Duration::from_secs(10), response.read(READ_BODY_CAP)).await??)
+}
+
+#[cfg(feature = "http2")]
+#[test]
+fn a_received_body_comes_back_in_one_read() -> TestResult {
+    let (app, _cookies) = app()?;
+    let http = app.state::<Http>();
+    let body = pattern(300 * 1024);
+
+    tauri::async_runtime::block_on(async {
+        let (mut response, pieces) = get_http2_pieces(&http, &[]).await?;
+        for piece in body.chunks(7 * 1024) {
+            pieces.send(piece.to_vec().into())?;
+        }
+        drop(pieces);
+        let_it_arrive().await;
+
+        assert_eq!(read_now(&mut response).await?, Some(body.clone()));
+        // Only the end, or the empty frame HTTP/2 may close the stream with.
+        let (rest, error) = read_all_async(&mut response, READ_BODY_CAP).await;
+        assert!(rest.concat().is_empty());
+        assert!(error.is_none());
+        Ok(())
+    })
+}
+
+#[cfg(all(feature = "http2", feature = "gzip"))]
+#[test]
+fn a_received_gzip_body_comes_back_in_one_read() -> TestResult {
+    let (app, _cookies) = app()?;
+    let http = app.state::<Http>();
+    let body = pattern(300 * 1024);
+
+    tauri::async_runtime::block_on(async {
+        let (mut response, pieces) =
+            get_http2_pieces(&http, &[("content-encoding", "gzip")]).await?;
+        pieces.send(gzip(&body).into())?;
+        drop(pieces);
+        let_it_arrive().await;
+
+        assert_eq!(read_now(&mut response).await?, Some(body.clone()));
+        // Only the end, or the empty frame HTTP/2 may close the stream with.
+        let (rest, error) = read_all_async(&mut response, READ_BODY_CAP).await;
+        assert!(rest.concat().is_empty());
+        assert!(error.is_none());
+        Ok(())
+    })
+}
+
+#[cfg(feature = "http2")]
+#[test]
+fn a_slow_body_streams_each_piece_as_it_arrives() -> TestResult {
+    let (app, _cookies) = app()?;
+    let http = app.state::<Http>();
+
+    tauri::async_runtime::block_on(async {
+        let (mut response, pieces) = get_http2_pieces(&http, &[]).await?;
+
+        // Each read returns what has arrived, while the server holds the rest.
+        pieces.send("first".into())?;
+        assert_eq!(read_now(&mut response).await?, Some(b"first".to_vec()));
+        pieces.send("second".into())?;
+        assert_eq!(read_now(&mut response).await?, Some(b"second".to_vec()));
+
+        // A read that starts before the next piece waits for it.
+        let reading = read_now(&mut response);
+        let sending_later = async {
+            let_it_arrive().await;
+            pieces.send("third".into())
+        };
+        let (read, sent) = tokio::join!(reading, sending_later);
+        sent?;
+        assert_eq!(read?, Some(b"third".to_vec()));
+
+        // HTTP/2 ends a streamed body with an empty frame, which a read
+        // returns as an empty chunk.
+        drop(pieces);
+        let (rest, error) = read_all_async(&mut response, READ_BODY_CAP).await;
+        assert!(rest.concat().is_empty());
+        assert!(error.is_none());
+        Ok(())
+    })
+}
+
+#[cfg(feature = "http2")]
+#[test]
+fn a_large_received_body_comes_back_a_cap_at_a_time() -> TestResult {
+    let (app, _cookies) = app()?;
+    let http = app.state::<Http>();
+    let body = pattern(3 * READ_BODY_CAP + 1000);
+
+    tauri::async_runtime::block_on(async {
+        let (mut response, pieces) = get_http2_pieces(&http, &[]).await?;
+        for piece in body.chunks(64 * 1024) {
+            pieces.send(piece.to_vec().into())?;
+        }
+        drop(pieces);
+
+        let mut read = Vec::new();
+        let mut full_reads = 0;
+        while let Some(data) = read_now(&mut response).await? {
+            assert!(data.len() <= READ_BODY_CAP, "read {} bytes", data.len());
+            full_reads += usize::from(data.len() == READ_BODY_CAP);
+            read.extend(data);
+            let_it_arrive().await;
+        }
+        assert_eq!(read, body);
+        // More than the cap had arrived before each of the first reads.
+        assert!(full_reads >= 1, "no read reached the cap");
+        Ok(())
+    })
+}
+
+#[test]
+fn a_connection_lost_mid_body_fails_the_read_instead_of_ending_the_body() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}/", listener.local_addr()?);
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = BufReader::new(stream.try_clone()?);
+        let mut line = String::new();
+        while request.read_line(&mut line)? > 2 {
+            line.clear();
+        }
+        stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\npartial")?;
+        stream.shutdown(Shutdown::Both)
+    });
+    let (app, _cookies) = app()?;
+    let http = app.state::<Http>();
+
+    let (reads, error) = tauri::async_runtime::block_on(async {
+        let (client, _) = request_client(&http, ClientOptions::default())?;
+        let mut response = ReqwestResponse::new(client.get(&url).send().await?);
+        let_it_arrive().await;
+        Ok::<_, TestError>(read_all_async(&mut response, READ_BODY_CAP).await)
+    })?;
+    server.join().expect("server thread")?;
+
+    assert_eq!(reads.concat(), b"partial");
+    assert!(error.is_some());
     Ok(())
 }

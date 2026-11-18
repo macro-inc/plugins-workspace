@@ -2,8 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use std::{future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    pin::{pin, Pin},
+    str::FromStr,
+    sync::Arc,
+    task::Poll,
+    time::Duration,
+};
 
+use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use reqwest::{redirect::Policy, NoProxy};
 use serde::{Deserialize, Serialize};
@@ -22,8 +30,67 @@ use crate::{
 
 const HTTP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 
-struct ReqwestResponse(reqwest::Response);
+/// The most body bytes one `fetch_read_body` returns.
+pub(crate) const READ_BODY_CAP: usize = 1024 * 1024;
+
+pub(crate) struct ReqwestResponse {
+    res: reqwest::Response,
+    /// What a read took from the body but did not return: data past the cap,
+    /// the end of the body, or a body error. The next read returns it first.
+    held: Option<std::result::Result<Option<Bytes>, reqwest::Error>>,
+}
 impl tauri::Resource for ReqwestResponse {}
+
+impl ReqwestResponse {
+    pub(crate) fn new(res: reqwest::Response) -> Self {
+        Self { res, held: None }
+    }
+
+    /// Waits for the next chunk of the body, then also takes every chunk that
+    /// is already available without waiting, up to `cap` bytes in all, so a
+    /// buffered body crosses IPC in one read instead of one per chunk. Returns
+    /// `None` at the end of the body.
+    pub(crate) async fn read(&mut self, cap: usize) -> Result<Option<Vec<u8>>> {
+        let first = match self.held.take() {
+            Some(held) => held?,
+            None => self.res.chunk().await?,
+        };
+        let Some(mut first) = first else {
+            return Ok(None);
+        };
+        // A chunk larger than the cap (a `data:` URL is one chunk) is returned
+        // a cap at a time; the loop below then has no room left to run.
+        if first.len() > cap {
+            self.held = Some(Ok(Some(first.split_off(cap))));
+        }
+        let mut data = first.to_vec();
+
+        while data.len() < cap {
+            // Poll once: a chunk that is not ready yet ends this read. The
+            // future keeps no state of its own, so dropping it while pending
+            // leaves the body where it was. That poll also starts reqwest's
+            // read timeout until the next read; the plugin sets none, and one
+            // set later would have to allow for the time between reads.
+            let mut chunk = pin!(self.res.chunk());
+            let polled = std::future::poll_fn(|cx| Poll::Ready(chunk.as_mut().poll(cx)));
+            let Poll::Ready(next) = polled.await else {
+                break;
+            };
+            match next {
+                Ok(Some(chunk)) if data.len() + chunk.len() <= cap => {
+                    data.extend_from_slice(&chunk);
+                }
+                // A chunk past the cap, the end, or an error: the next read
+                // returns it, after this one returns the data it already has.
+                next => {
+                    self.held = Some(next);
+                    break;
+                }
+            }
+        }
+        Ok(Some(data))
+    }
+}
 
 type CancelableResponseResult = Result<reqwest::Response>;
 type CancelableResponseFuture =
@@ -450,7 +517,7 @@ pub async fn fetch_send<R: Runtime>(
     }
 
     let mut resources_table = webview.resources_table();
-    let rid = resources_table.add(ReqwestResponse(res));
+    let rid = resources_table.add(ReqwestResponse::new(res));
 
     Ok(FetchResponse {
         status: status.as_u16(),
@@ -477,9 +544,8 @@ pub async fn fetch_read_body<R: Runtime>(
     // for potential future calls to `fetch_cancel_body`
     let res_ptr = Arc::as_ptr(&res) as *mut ReqwestResponse;
     let res = unsafe { &mut *res_ptr };
-    let res = &mut res.0;
 
-    let Some(chunk) = res.chunk().await? else {
+    let Some(mut data) = res.read(READ_BODY_CAP).await? else {
         let mut resources_table = webview.resources_table();
         resources_table.close(rid)?;
 
@@ -487,11 +553,10 @@ pub async fn fetch_read_body<R: Runtime>(
         return Ok(tauri::ipc::Response::new(vec![1]));
     };
 
-    let mut chunk = chunk.to_vec();
     // append a 0 byte to indicate that the body is not empty
-    chunk.push(0);
+    data.push(0);
 
-    Ok(tauri::ipc::Response::new(chunk))
+    Ok(tauri::ipc::Response::new(data))
 }
 
 #[command]
