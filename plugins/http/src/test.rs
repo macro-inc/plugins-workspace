@@ -824,3 +824,279 @@ fn a_connection_lost_mid_body_fails_the_read_instead_of_ending_the_body() -> Tes
     assert!(error.is_some());
     Ok(())
 }
+
+/// An app with the plugin and one webview window showing `url`, whose page
+/// may call `fetch` and `fetch_send` for any local URL, as an app's
+/// capability would allow.
+fn app_with_webview(
+    url: &str,
+) -> std::result::Result<(TestApp, tauri::WebviewWindow<MockRuntime>), TestError> {
+    use tauri::utils::acl::{
+        resolved::{Resolved, ResolvedScope},
+        ExecutionContext,
+    };
+
+    let mut resolved = Resolved::default();
+    resolved.global_scope.insert(
+        "http".into(),
+        ResolvedScope {
+            allow: vec![serde_json::json!({ "url": "http://127.0.0.1:*" }).into()],
+            deny: Vec::new(),
+        },
+    );
+    let mut authority = tauri::runtime_authority!(Default::default(), resolved);
+    for command in ["plugin:http|fetch", "plugin:http|fetch_send"] {
+        authority.__allow_command(command.into(), ExecutionContext::Local);
+    }
+    let mut context = mock_context(noop_assets());
+    *context.runtime_authority_mut() = authority;
+
+    let directory = tempfile::tempdir()?;
+    let app = mock_builder()
+        .plugin(init_with_cookie_store_dir(directory.path()))
+        .build(context)?;
+    let webview =
+        tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::External(url.parse()?))
+            .build()?;
+    Ok(((app, directory), webview))
+}
+
+/// Calls a plugin command the way the page does and returns its JSON result.
+fn invoke(
+    webview: &tauri::WebviewWindow<MockRuntime>,
+    command: &str,
+    body: serde_json::Value,
+) -> std::result::Result<serde_json::Value, TestError> {
+    let response = tauri::test::get_ipc_response(
+        webview,
+        tauri::webview::InvokeRequest {
+            cmd: format!("plugin:http|{command}"),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: "tauri://localhost".parse()?,
+            body: tauri::ipc::InvokeBody::Json(body),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_string(),
+        },
+    )
+    .map_err(|error| format!("{command} failed: {error}"))?;
+    Ok(response.deserialize()?)
+}
+
+/// Sends a GET through the `fetch` and `fetch_send` commands with `headers`,
+/// and returns the `Origin` header the server received, if any.
+fn origin_on_the_wire(
+    webview: &tauri::WebviewWindow<MockRuntime>,
+    headers: &[(&str, &str)],
+) -> std::result::Result<Option<String>, TestError> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}/", listener.local_addr()?);
+    let server = std::thread::spawn(move || -> std::io::Result<Option<String>> {
+        let (mut stream, _) = listener.accept()?;
+        let mut origin = None;
+        for line in BufReader::new(stream.try_clone()?).lines() {
+            let line = line?;
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("origin") {
+                    origin = Some(value.trim().to_string());
+                }
+            }
+        }
+        stream.write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")?;
+        Ok(origin)
+    });
+
+    let rid = invoke(
+        webview,
+        "fetch",
+        serde_json::json!({
+            "clientConfig": { "method": "GET", "url": url, "headers": headers }
+        }),
+    )?;
+    let response = invoke(webview, "fetch_send", serde_json::json!({ "rid": rid }))?;
+    assert_eq!(response["status"], 204);
+    Ok(server.join().map_err(|_| "the server panicked")??)
+}
+
+#[test]
+fn fetch_sends_the_recorded_origin() -> TestResult {
+    let ((app, _directory), webview) = app_with_webview("http://tauri.localhost/inbox")?;
+    let http = app.state::<Http>();
+
+    // No page load seen yet: the URL is read.
+    assert_eq!(
+        origin_on_the_wire(&webview, &[])?.as_deref(),
+        Some("http://tauri.localhost")
+    );
+
+    http.page_loaded("main", &"https://other.example:8443/page".parse()?);
+    assert_eq!(
+        origin_on_the_wire(&webview, &[])?.as_deref(),
+        Some("https://other.example:8443")
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "unsafe-headers"))]
+#[test]
+fn fetch_replaces_an_origin_the_page_sends() -> TestResult {
+    let ((_app, _directory), webview) = app_with_webview("http://tauri.localhost/")?;
+
+    for origin in ["https://chosen.example", ""] {
+        assert_eq!(
+            origin_on_the_wire(&webview, &[("Origin", origin)])?.as_deref(),
+            Some("http://tauri.localhost")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "unsafe-headers")]
+#[test]
+fn fetch_keeps_an_origin_the_page_sends() -> TestResult {
+    let ((_app, _directory), webview) = app_with_webview("http://tauri.localhost/")?;
+
+    assert_eq!(
+        origin_on_the_wire(&webview, &[("Origin", "https://chosen.example")])?.as_deref(),
+        Some("https://chosen.example")
+    );
+    // An empty one removes the header.
+    assert_eq!(origin_on_the_wire(&webview, &[("Origin", "")])?, None);
+    Ok(())
+}
+
+#[test]
+fn devtools_pages_do_not_change_the_origin() -> TestResult {
+    let ((app, _directory), webview) = app_with_webview("http://tauri.localhost/")?;
+    let http = app.state::<Http>();
+    http.page_loaded("main", &"http://tauri.localhost/".parse()?);
+
+    http.page_loaded(
+        "main",
+        &"devtools://devtools/bundled/devtools_app.html".parse()?,
+    );
+    http.page_loaded(
+        "main",
+        &"chrome-devtools://devtools/inspector.html".parse()?,
+    );
+
+    assert_eq!(
+        origin_on_the_wire(&webview, &[])?.as_deref(),
+        Some("http://tauri.localhost")
+    );
+    Ok(())
+}
+
+#[test]
+fn an_opaque_page_is_not_recorded() -> TestResult {
+    let ((app, _directory), webview) = app_with_webview("http://tauri.localhost/")?;
+    let http = app.state::<Http>();
+    http.page_loaded("main", &"https://app.example/".parse()?);
+
+    // CEF's placeholder before the first real page.
+    http.page_loaded("main", &"data:text/html;charset=utf-8,".parse()?);
+    assert_eq!(http.recorded_origin("main"), None);
+    // So the next request reads the URL, and records that.
+    assert_eq!(
+        origin_on_the_wire(&webview, &[])?.as_deref(),
+        Some("http://tauri.localhost")
+    );
+    assert_eq!(
+        http.recorded_origin("main").as_deref(),
+        Some("http://tauri.localhost")
+    );
+
+    // A webview showing an opaque page still sends `null`, as before, without
+    // recording it.
+    webview.navigate("about:blank".parse()?)?;
+    http.page_loaded("main", &"about:blank".parse()?);
+    assert_eq!(origin_on_the_wire(&webview, &[])?.as_deref(), Some("null"));
+    assert_eq!(http.recorded_origin("main"), None);
+    Ok(())
+}
+
+#[test]
+fn a_webview_without_a_page_load_reads_its_url_once() -> TestResult {
+    let ((app, _directory), webview) = app_with_webview("https://app.example/inbox")?;
+    let http = app.state::<Http>();
+
+    assert_eq!(http.recorded_origin("main"), None);
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("https://app.example")
+    );
+    assert_eq!(
+        http.recorded_origin("main").as_deref(),
+        Some("https://app.example")
+    );
+
+    // The mock moves the URL without a page load: a recorded origin is used
+    // as it is, without reading the URL again.
+    webview.navigate("https://elsewhere.example/".parse()?)?;
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("https://app.example")
+    );
+    Ok(())
+}
+
+#[test]
+fn a_page_load_from_another_origin_changes_the_origin() -> TestResult {
+    let ((app, _directory), webview) = app_with_webview("https://app.example/inbox")?;
+    let http = app.state::<Http>();
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("https://app.example")
+    );
+
+    http.page_loaded("main", &"https://other.example:8443/page?q=1".parse()?);
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("https://other.example:8443")
+    );
+
+    http.page_loaded("main", &"http://tauri.localhost/index.html".parse()?);
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("http://tauri.localhost")
+    );
+    Ok(())
+}
+
+#[test]
+fn a_tauri_scheme_page_sends_tauri_localhost() -> TestResult {
+    let ((app, _directory), webview) = app_with_webview("tauri://localhost/index.html")?;
+    let http = app.state::<Http>();
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("tauri://localhost")
+    );
+
+    http.page_loaded("main", &"https://app.example/".parse()?);
+    http.page_loaded("main", &"tauri://localhost/settings".parse()?);
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("tauri://localhost")
+    );
+    Ok(())
+}
+
+#[test]
+fn closed_webviews_are_forgotten() -> TestResult {
+    let ((app, _directory), _webview) = app_with_webview("https://app.example/")?;
+    let http = app.state::<Http>();
+    http.page_loaded("main", &"https://app.example/".parse()?);
+    http.page_loaded("closed", &"https://closed.example/".parse()?);
+
+    http.forget_closed_webviews(app.handle());
+
+    assert_eq!(
+        http.recorded_origin("main").as_deref(),
+        Some("https://app.example")
+    );
+    assert_eq!(http.recorded_origin("closed"), None);
+    Ok(())
+}

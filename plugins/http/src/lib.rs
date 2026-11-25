@@ -6,14 +6,15 @@
 
 pub use reqwest;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Mutex, PoisonError, RwLock},
     time::{Duration, Instant, SystemTime},
 };
 use tauri::{
     plugin::{Builder, TauriPlugin},
-    Manager, Runtime,
+    webview::PageLoadEvent,
+    AppHandle, Manager, Runtime, Url, Webview, WindowEvent,
 };
 
 pub use error::{Error, Result};
@@ -96,6 +97,8 @@ pub struct Http {
     /// Origins the current client has connected to.
     reached: Mutex<HashSet<String>>,
     last_use: Mutex<LastUse>,
+    /// The `Origin` each webview's requests carry, by webview label.
+    origins: Mutex<HashMap<String, String>>,
 }
 
 impl Http {
@@ -115,6 +118,7 @@ impl Http {
             client: RwLock::new(client),
             reached: Mutex::default(),
             last_use: Mutex::new(LastUse::now()),
+            origins: Mutex::default(),
         })
     }
 
@@ -182,6 +186,89 @@ impl Http {
         Ok(())
     }
 
+    /// The `Origin` header for requests from `webview`: the origin of the
+    /// page it shows.
+    ///
+    /// Reading a webview's URL waits for the UI thread to answer, holding the
+    /// thread that asks; for a request, that is an async runtime worker. So
+    /// the origin is recorded as each page loads ([`Self::page_loaded`]), and
+    /// the URL is read only for a webview no usable page load has been seen
+    /// for yet. `None` when that read fails, as the request then had no
+    /// `Origin`.
+    pub(crate) fn origin<R: Runtime>(&self, webview: &Webview<R>) -> Option<String> {
+        if let Some(origin) = self.origins_lock().get(webview.label()) {
+            return Some(origin.clone());
+        }
+
+        // Not under the lock: the UI thread may be recording a page load.
+        let origin = origin_of(&webview.url().ok()?);
+        if origin == OPAQUE_ORIGIN {
+            return Some(origin);
+        }
+
+        let mut origins = self.origins_lock();
+        // A window destroyed during the read has already been forgotten;
+        // recording it again would outlive it. Its window leaves the manager
+        // before the plugin hears it was destroyed, and that is checked
+        // under the same lock, so one of the two always sees the other.
+        if webview
+            .app_handle()
+            .get_webview_window(webview.label())
+            .is_none()
+        {
+            return Some(origin);
+        }
+        // A page load recorded meanwhile is newer than the URL read here.
+        Some(
+            origins
+                .entry(webview.label().to_string())
+                .or_insert(origin)
+                .clone(),
+        )
+    }
+
+    /// Records the page `webview_label` is loading, so its requests carry
+    /// that page's origin from then on.
+    ///
+    /// A DevTools page is ignored: on CEF a DevTools window can report its
+    /// loads as the inspected webview's. A page with an opaque origin, such as
+    /// the `data:` page CEF shows before the first real one, forgets the
+    /// origin instead of recording `null`, so a request reads the URL again.
+    pub(crate) fn page_loaded(&self, webview_label: &str, url: &Url) {
+        if matches!(url.scheme(), "devtools" | "chrome-devtools") {
+            return;
+        }
+
+        let origin = origin_of(url);
+        let mut origins = self.origins_lock();
+        if origin == OPAQUE_ORIGIN {
+            origins.remove(webview_label);
+        } else {
+            origins.insert(webview_label.to_string(), origin);
+        }
+    }
+
+    /// Forgets the origins of webviews that no longer exist.
+    ///
+    /// Without Tauri's `unstable` feature every webview is a webview window,
+    /// which goes away only with its window. A webview added to a window with
+    /// that feature is forgotten too; the next request from it reads its URL
+    /// once again.
+    pub(crate) fn forget_closed_webviews<R: Runtime>(&self, app: &AppHandle<R>) {
+        self.origins_lock()
+            .retain(|label, _| app.get_webview_window(label).is_some());
+    }
+
+    /// The origin recorded for `webview_label`, without reading its URL.
+    #[cfg(all(test, feature = "cookies"))]
+    pub(crate) fn recorded_origin(&self, webview_label: &str) -> Option<String> {
+        self.origins_lock().get(webview_label).cloned()
+    }
+
+    fn origins_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.origins.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Sends a request built with the shared client.
     ///
     /// Where the client reads the system proxy settings when it is built,
@@ -219,6 +306,20 @@ impl Http {
         }
 
         result
+    }
+}
+
+/// How an opaque origin, such as a `data:` or `about:blank` page's,
+/// serializes.
+const OPAQUE_ORIGIN: &str = "null";
+
+/// The `Origin` a page at `url` sends.
+fn origin_of(url: &Url) -> String {
+    // The url crate returns OpaqueOrigin for tauri://localhost which serializes to "null"
+    if url.scheme() == "tauri" {
+        "tauri://localhost".to_string()
+    } else {
+        url.origin().ascii_serialization()
     }
 }
 
@@ -292,7 +393,26 @@ pub fn init_with_cookie_store_dir<R: Runtime>(directory: impl Into<PathBuf>) -> 
 
             Ok(())
         })
+        .on_page_load(|webview, payload| {
+            // Started too, so a request made as a page from another origin
+            // loads never carries the previous page's origin.
+            if let (PageLoadEvent::Started | PageLoadEvent::Finished, Some(state)) =
+                (payload.event(), webview.try_state::<Http>())
+            {
+                state.page_loaded(webview.label(), payload.url());
+            }
+        })
         .on_event(|app, event| {
+            if let tauri::RunEvent::WindowEvent {
+                event: WindowEvent::Destroyed,
+                ..
+            } = event
+            {
+                if let Some(state) = app.try_state::<Http>() {
+                    state.forget_closed_webviews(app);
+                }
+            }
+
             #[cfg(feature = "cookies")]
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<Http>();
