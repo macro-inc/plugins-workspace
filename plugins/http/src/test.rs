@@ -824,3 +824,97 @@ fn a_connection_lost_mid_body_fails_the_read_instead_of_ending_the_body() -> Tes
     assert!(error.is_some());
     Ok(())
 }
+
+/// An app with the plugin and one webview window showing `url`.
+fn app_with_webview(
+    url: &str,
+) -> std::result::Result<(TestApp, tauri::WebviewWindow<MockRuntime>), TestError> {
+    let (app, directory) = app()?;
+    let webview =
+        tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::External(url.parse()?))
+            .build()?;
+    Ok(((app, directory), webview))
+}
+
+#[test]
+fn a_webview_without_a_page_load_reads_its_url_once() -> TestResult {
+    let ((app, _directory), webview) = app_with_webview("https://app.example/inbox")?;
+    let http = app.state::<Http>();
+
+    assert_eq!(http.recorded_origin("main"), None);
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("https://app.example")
+    );
+    assert_eq!(
+        http.recorded_origin("main").as_deref(),
+        Some("https://app.example")
+    );
+
+    // The mock moves the URL without a page load: a recorded origin is used
+    // as it is, without reading the URL again.
+    webview.navigate("https://elsewhere.example/".parse()?)?;
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("https://app.example")
+    );
+    Ok(())
+}
+
+#[test]
+fn a_page_load_from_another_origin_changes_the_origin() -> TestResult {
+    let ((app, _directory), webview) = app_with_webview("https://app.example/inbox")?;
+    let http = app.state::<Http>();
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("https://app.example")
+    );
+
+    http.page_loaded("main", &"https://other.example:8443/page?q=1".parse()?);
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("https://other.example:8443")
+    );
+
+    http.page_loaded("main", &"http://tauri.localhost/index.html".parse()?);
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("http://tauri.localhost")
+    );
+    Ok(())
+}
+
+#[test]
+fn a_tauri_scheme_page_sends_tauri_localhost() -> TestResult {
+    let ((app, _directory), webview) = app_with_webview("tauri://localhost/index.html")?;
+    let http = app.state::<Http>();
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("tauri://localhost")
+    );
+
+    http.page_loaded("main", &"https://app.example/".parse()?);
+    http.page_loaded("main", &"tauri://localhost/settings".parse()?);
+    assert_eq!(
+        http.origin(webview.as_ref()).as_deref(),
+        Some("tauri://localhost")
+    );
+    Ok(())
+}
+
+#[test]
+fn closed_webviews_are_forgotten() -> TestResult {
+    let ((app, _directory), _webview) = app_with_webview("https://app.example/")?;
+    let http = app.state::<Http>();
+    http.page_loaded("main", &"https://app.example/".parse()?);
+    http.page_loaded("closed", &"https://closed.example/".parse()?);
+
+    http.forget_closed_webviews(app.handle());
+
+    assert_eq!(
+        http.recorded_origin("main").as_deref(),
+        Some("https://app.example")
+    );
+    assert_eq!(http.recorded_origin("closed"), None);
+    Ok(())
+}
