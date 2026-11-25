@@ -192,8 +192,9 @@ impl Http {
     /// Reading a webview's URL waits for the UI thread to answer, holding the
     /// thread that asks; for a request, that is an async runtime worker. So
     /// the origin is recorded as each page loads ([`Self::page_loaded`]), and
-    /// the URL is read only for a webview no page load has been seen for yet.
-    /// `None` when that read fails, as the request then had no `Origin`.
+    /// the URL is read only for a webview no usable page load has been seen
+    /// for yet. `None` when that read fails, as the request then had no
+    /// `Origin`.
     pub(crate) fn origin<R: Runtime>(&self, webview: &Webview<R>) -> Option<String> {
         if let Some(origin) = self.origins_lock().get(webview.label()) {
             return Some(origin.clone());
@@ -201,9 +202,25 @@ impl Http {
 
         // Not under the lock: the UI thread may be recording a page load.
         let origin = origin_of(&webview.url().ok()?);
+        if origin == OPAQUE_ORIGIN {
+            return Some(origin);
+        }
+
+        let mut origins = self.origins_lock();
+        // A window destroyed during the read has already been forgotten;
+        // recording it again would outlive it. Its window leaves the manager
+        // before the plugin hears it was destroyed, and that is checked
+        // under the same lock, so one of the two always sees the other.
+        if webview
+            .app_handle()
+            .get_webview_window(webview.label())
+            .is_none()
+        {
+            return Some(origin);
+        }
         // A page load recorded meanwhile is newer than the URL read here.
         Some(
-            self.origins_lock()
+            origins
                 .entry(webview.label().to_string())
                 .or_insert(origin)
                 .clone(),
@@ -212,9 +229,23 @@ impl Http {
 
     /// Records the page `webview_label` is loading, so its requests carry
     /// that page's origin from then on.
+    ///
+    /// A DevTools page is ignored: on CEF a DevTools window can report its
+    /// loads as the inspected webview's. A page with an opaque origin, such as
+    /// the `data:` page CEF shows before the first real one, forgets the
+    /// origin instead of recording `null`, so a request reads the URL again.
     pub(crate) fn page_loaded(&self, webview_label: &str, url: &Url) {
-        self.origins_lock()
-            .insert(webview_label.to_string(), origin_of(url));
+        if matches!(url.scheme(), "devtools" | "chrome-devtools") {
+            return;
+        }
+
+        let origin = origin_of(url);
+        let mut origins = self.origins_lock();
+        if origin == OPAQUE_ORIGIN {
+            origins.remove(webview_label);
+        } else {
+            origins.insert(webview_label.to_string(), origin);
+        }
     }
 
     /// Forgets the origins of webviews that no longer exist.
@@ -277,6 +308,10 @@ impl Http {
         result
     }
 }
+
+/// How an opaque origin, such as a `data:` or `about:blank` page's,
+/// serializes.
+const OPAQUE_ORIGIN: &str = "null";
 
 /// The `Origin` a page at `url` sends.
 fn origin_of(url: &Url) -> String {
